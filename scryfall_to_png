@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+import csv
+import os
+import re
+import sys
+import requests
+import tkinter as tk
+from tkinter import filedialog
+
+SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
+
+HEADERS = {
+    "User-Agent": "ShopifyScryfalltoPNG (jeffrey@cashcardsunlimited.com)"
+}
+
+# -----------------------------
+# FILE PICKER
+# -----------------------------
+def pick_export_file():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(
+        title="Select Shopify Export CSV",
+        filetypes=[("CSV Files", "*.csv")]
+    )
+    root.destroy()
+    if not file_path:
+        print("No file selected.")
+        sys.exit(1)
+    return file_path
+
+# -----------------------------
+# NAME CLEANING
+# -----------------------------
+def extract_name(title: str) -> str:
+    base = title.split(" - ")[0].strip()
+    base = re.sub(r"\s*\([^)]*\)$", "", base).strip()
+    return base
+
+# -----------------------------
+# SET CODE
+# -----------------------------
+def extract_set_code(title: str) -> str | None:
+    m = re.search(r"\(([^()]*)\)\s*$", title)
+    if not m:
+        return None
+    code = m.group(1).strip().lower()
+    if code == "list":
+        code = "plst"
+    return code
+
+# -----------------------------
+# COLLECTOR NUMBER
+# -----------------------------
+def extract_collector_number(body_html: str) -> str | None:
+    m = re.search(
+        r"<strong>\s*#:\s*</strong>\s*([0-9A-Za-z\-]+)",
+        body_html,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    return m.group(1).strip()
+
+# -----------------------------
+# ESCAPING
+# -----------------------------
+def escape_for_scryfall(q: str) -> str:
+    q = q.replace("\\", "\\\\")
+    q = q.replace("'", "\\'")
+    q = q.replace(":", "\\:")
+    return q
+
+# -----------------------------
+# SCRYFALL SEARCH
+# -----------------------------
+def scryfall_search(name: str, set_code: str):
+    escaped = escape_for_scryfall(name)
+    q = f"{escaped} set:{set_code}"
+
+    resp = requests.get(SCRYFALL_SEARCH_URL, params={"q": q}, headers=HEADERS)
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    if data.get("object") != "list":
+        return None
+
+    return data.get("data", [])
+
+# -----------------------------
+# PICK PRINTING
+# -----------------------------
+def pick_printing(cards, number_hint):
+    if not cards:
+        return None
+
+    if not number_hint:
+        return cards[0]
+
+    candidates = []
+    for c in cards:
+        cn = c.get("collector_number", "")
+        if cn == number_hint or cn.endswith(f"-{number_hint}") or cn.endswith(number_hint):
+            candidates.append(c)
+
+    if candidates:
+        return candidates[0]
+
+    return cards[0]
+
+# -----------------------------
+# PNG EXTRACTION
+# -----------------------------
+def extract_png_urls(card_data):
+    if "card_faces" in card_data and card_data["card_faces"]:
+        urls = []
+        for face in card_data["card_faces"]:
+            iu = face.get("image_uris")
+            if iu and iu.get("png"):
+                urls.append(iu["png"])
+        if urls:
+            return urls
+
+    iu = card_data.get("image_uris")
+    if iu and iu.get("png"):
+        return [iu["png"]]
+
+    return []
+
+# -----------------------------
+# MAIN CSV PROCESSOR
+# -----------------------------
+def process_csv(input_path: str, output_path: str):
+    with open(input_path, newline="", encoding="utf-8") as infile:
+        reader = list(csv.DictReader(infile))
+
+    fieldnames = reader[0].keys()
+    output_rows = []
+    success = 0
+    fail = 0
+
+    print("\n=== Scryfall Image Processor (Diagnostic Mode) ===\n")
+
+    for row in reader:
+        vendor = row.get("Vendor", "")
+        title = row.get("Title", "")
+        body_html = row.get("Body (HTML)", "") or ""
+
+        if vendor != "Magic: The Gathering":
+            output_rows.append(row)
+            continue
+
+        print(f"\n=== Processing: {title} ===")
+
+        name = extract_name(title)
+        set_code = extract_set_code(title)
+        number_hint = extract_collector_number(body_html)
+
+        print(f"  → name: {name}")
+        print(f"  → set_code: {set_code}")
+        print(f"  → collector_number: {number_hint}")
+
+        if not name or not set_code:
+            print("  ✘ Missing name or set_code")
+            fail += 1
+            output_rows.append(row)
+            continue
+
+        cards = scryfall_search(name, set_code)
+        if not cards:
+            print("  ✘ SEARCH FAILED")
+            fail += 1
+            output_rows.append(row)
+            continue
+
+        print(f"  → Found {len(cards)} candidate printings")
+
+        card_data = pick_printing(cards, number_hint)
+        if not card_data:
+            print("  ✘ NO MATCHING PRINTING")
+            fail += 1
+            output_rows.append(row)
+            continue
+
+        print(f"  → Selected printing collector_number: {card_data.get('collector_number')}")
+
+        png_urls = extract_png_urls(card_data)
+        if not png_urls:
+            print("  ✘ NO PNG FOUND")
+            fail += 1
+            output_rows.append(row)
+            continue
+
+        print(f"  ✔ PNG URLs: {png_urls}")
+
+        for idx, png_url in enumerate(png_urls, start=1):
+            new_row = row.copy()
+            new_row["Image Src"] = png_url
+            new_row["Image Position"] = str(idx)
+            output_rows.append(new_row)
+            success += 1
+
+    # -----------------------------
+    # WRITE OUTPUT WITH ERROR TRAPPING
+    # -----------------------------
+    print(f"\nAttempting to write output file to: {output_path}")
+
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8") as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(output_rows)
+        print("Primary write method succeeded.")
+    except Exception as e:
+        print(f"Primary write FAILED: {e}")
+
+        # Fallback #1 — raw write
+        try:
+            with open(output_path, "w", encoding="utf-8") as outfile:
+                outfile.write("RAW WRITE TEST\n")
+            print("Fallback raw write succeeded.")
+        except Exception as e2:
+            print(f"Fallback raw write FAILED: {e2}")
+
+        # Fallback #2 — write to script directory
+        fallback_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FALLBACK_OUTPUT.csv")
+        print(f"Attempting fallback write to: {fallback_path}")
+
+        try:
+            with open(fallback_path, "w", newline="", encoding="utf-8") as outfile:
+                writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(output_rows)
+            print(f"Fallback write succeeded: {fallback_path}")
+        except Exception as e3:
+            print(f"Fallback write FAILED: {e3}")
+
+    # -----------------------------
+    # FILE CONFIRMATION
+    # -----------------------------
+    if os.path.exists(output_path):
+        print(f"\nFILE EXISTS: {output_path}")
+    else:
+        print(f"\nFILE DOES NOT EXIST: {output_path}")
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    input_path = pick_export_file()
+
+    # Write output in SAME folder as input file
+    base_dir = os.path.dirname(os.path.abspath(input_path))
+    base_name = os.path.basename(input_path)
+    output_path = os.path.join(base_dir, f"NEW_{base_name}")
+
+    print(f"Writing output to: {output_path}")
+
+    process_csv(input_path, output_path)
+
+if __name__ == "__main__":
+    main()
