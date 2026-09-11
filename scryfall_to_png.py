@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Bulk-powered Scryfall → Shopify image resolver
+#Scryfall -> Shopify image extractor (PNG only)
 
 import csv
 import gzip
@@ -428,7 +428,7 @@ def extract_png_urls(card):
 class ScryfallBulkGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Bulk-Powered Scryfall Image Extractor")
+        self.title("Scryfall Image Extractor")
         self.geometry("800x550")
         self.resizable(False, False)
 
@@ -633,14 +633,14 @@ class ScryfallBulkGUI(tk.Tk):
 
             if not card:
                 fail += 1
-                self.log_message("  ✘ MATCH FAILED")
+                self.log_message("  X MATCH FAILED")
                 output_rows.append(row)
                 continue
 
             png_urls = extract_png_urls(card)
             if not png_urls:
                 fail += 1
-                self.log_message("  ✘ NO PNG FOUND")
+                self.log_message("  XNO PNG FOUND")
                 output_rows.append(row)
                 continue
 
