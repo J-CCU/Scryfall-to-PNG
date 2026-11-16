@@ -6,24 +6,37 @@ It matches each product to its exact Scryfall printing using a local copy of Scr
 
 The tool doesn't download image files. It writes Scryfall PNG image URLs into the CSV, and Shopify fetches the images when you import it.
 
+It is for Shopify store owners who list Magic singles and want official card images without uploading them by hand.
+
+## Quick start
+
+```
+python3 -m pip install requests      # Windows: py -m pip install requests
+python3 scryfall_to_png.py           # Windows: py scryfall_to_png.py
+```
+
+In the window (titled "Scryfall Image Extractor"), click **Load / Update Scryfall Bulk**, wait for "Index ready" in the log, then click **Select Shopify CSV** and pick your product export. The result is saved next to it as `NEW_<export name>`.
+
 ## Features
 
 - Downloads Scryfall's **All Cards** bulk data once and caches it. The cache is refreshed when it is more than 24 hours old and Scryfall has published a newer file.
 - Builds a lookup index and caches it to disk, so later launches start quickly.
 - Matches each card by:
-  1. Scryfall printing ID, when the CSV has one. This match takes priority.
-  2. Oracle ID, narrowed down by set, collector number, finish and name.
-  3. Name + set + collector number + finish.
+  1. Scryfall printing ID, when the CSV's Scryfall ID column has one. This match takes priority.
+  2. Oracle ID (same column), narrowed down by set, collector number, finish and name to exactly one printing.
+  3. Without an ID: name + set code, plus collector number and finish when they are present. The set code is required.
 - Leaves a product unmatched instead of guessing when the match is ambiguous. It never swaps in a printing from a different set.
 - Prefers English printings when there's more than one choice.
 - Handles double-faced cards. The front face goes on the product row. The back face goes on an image-only row that has the same Handle.
 - Fills in `Image Alt Text` when it's blank.
-- Passes non-Magic products through unchanged, apart from remapping their columns to the template.
+- Passes non-Magic products through without matching. Their columns are remapped to the template, and a blank `Image Alt Text` is filled from the title when the row has an image.
 - Writes the output CSV in one step at the end, so a failed run never leaves a half-written file.
 
 ## Requirements
 
-- Python 3.10 or newer, with Tkinter (included with the python.org installers)
+Running from source needs the following; the prebuilt app needs only internet access and disk space.
+
+- Python 3.10 or newer, with Tkinter (included with the python.org installers; on Linux install `python3-tk`, with Homebrew Python on macOS `brew install python-tk`)
 - [requests](https://pypi.org/project/requests/)
 - Internet access the first time you load the bulk data, and for later refreshes
 - Several GB of free disk space for the cached bulk file and index, plus enough memory to load the full card list while the index is built
@@ -32,7 +45,7 @@ The tool doesn't download image files. It writes Scryfall PNG image URLs into th
 # Windows
 py -m pip install requests
 
-# macOS
+# macOS / Linux
 python3 -m pip install requests
 ```
 
@@ -41,7 +54,7 @@ python3 -m pip install requests
 ### Prebuilt app (macOS, Apple Silicon)
 
 1. Unzip `Scryfall to PNG.app.zip`.
-2. Open `Scryfall to PNG.app`. If macOS blocks the unsigned app, right-click it and choose **Open**.
+2. Open `Scryfall to PNG.app`. The app isn't notarized, so macOS may block it the first time: right-click it and choose **Open**, or click **Open Anyway** in System Settings > Privacy & Security.
 
 The prebuilt app is for Apple Silicon (arm64) Macs only. On Windows, Intel Macs or Linux, run from source.
 
@@ -51,7 +64,7 @@ The prebuilt app is for Apple Silicon (arm64) Macs only. On Windows, Intel Macs 
 # Windows
 py scryfall_to_png.py
 
-# macOS
+# macOS / Linux
 python3 scryfall_to_png.py
 ```
 
@@ -68,10 +81,10 @@ A Shopify **product export** CSV, encoded as UTF-8. These columns are used:
 
 | Column | Used for |
 |---|---|
-| `Vendor` | Only rows with `Magic: The Gathering` are matched. Other rows pass through unchanged. |
+| `Vendor` | Only rows with exactly `Magic: The Gathering` are matched. Other rows pass through without matching. |
 | `Title` | Card name and set code. See the title format below. |
 | `Body (HTML)` | Collector number, read from `<strong>#:</strong> 123` |
-| `Handle` | Links image-only rows (the back faces of double-faced cards) to their product |
+| `Handle` | Links image-only rows (such as the back faces of double-faced cards) to their product. Also copied to `URL handle`. |
 | `Scryfall ID (product.metafields.custom.scryfall_id)` | Optional. A Scryfall printing ID or Oracle ID. Gives the most precise match. |
 | `Option1 Value`, `Option2 Value`, `Option3 Value`, `Tags` | Finish detection, together with the title |
 | `Image Src`, `Image Position`, `Image Alt Text` | Overwritten or filled in with the matched image |
@@ -91,11 +104,11 @@ A Shopify **product export** CSV, encoded as UTF-8. These columns are used:
 - `non-foil`, `nonfoil`, `not foil` or `regular finish` means nonfoil.
 - If neither appears, the finish isn't used to filter matches.
 
-**Image-only rows.** A row with blank Vendor, Title and Body (HTML) is treated as an extra image row for the product above it, matched through `Handle`. For a double-faced card, it gets the back-face PNG and `Image Position` 2.
+**Image-only rows.** A row with blank Vendor, Title and Body (HTML) is treated as an extra image row for a product earlier in the file with the same `Handle`. For a double-faced card, it gets the back-face PNG and `Image Position` 2. For any other card, it gets the front PNG and `Image Position` 1.
 
 ## Output
 
-The output is a new CSV named `NEW_<original file name>.csv`, saved in the same folder as the input. If that file already exists, it's overwritten. The file is UTF-8 with a BOM.
+The output is a new CSV named `NEW_` plus the input file name (for example `products_export.csv` becomes `NEW_products_export.csv`), saved in the same folder as the input. If that file already exists, it's overwritten. The file is UTF-8 with a BOM.
 
 The columns follow Shopify's product import template, in this order:
 
@@ -113,9 +126,10 @@ Values for most columns are copied from the matching export column. For example,
   - `Product image URL` is set to the Scryfall PNG URL.
   - `Image position` is set to 1 for the front face, or 2 for the back face of a double-faced card.
 - `Google Shopping / Ad group name` and `Google Shopping / Ads labels` are always blank.
+- `Barcode` is read from a `Variant Barcodes` column, so it is blank for a standard Shopify export (which names the column `Variant Barcode`).
 - `Inventory quantity` and `Continue selling when out of stock` are both always set to `deny`.
 
-Rows that don't match are still written to the output with their original image data. The reason they failed is shown in the GUI log. No separate error report is created.
+Rows that don't match are still written to the output with their original image data. The reason they failed is shown in the GUI log. No separate error report is created. The success and failure counts in the final message cover Magic and image-only rows only; non-Magic rows aren't counted.
 
 ## Settings, config and cache
 
@@ -133,15 +147,17 @@ There's no settings file. The app stores its cache in a per-user data folder:
 | `bulk_metadata.json` | `updated_at` timestamp of the cached bulk file |
 | `scryfall_all_cards_index_en.pkl` | Cached lookup index, rebuilt when the bulk data changes |
 
-**When the cache refreshes.** When the bulk file is more than 24 hours old, the app checks Scryfall's metadata and downloads a new file only if Scryfall has published a newer one. If Scryfall can't be reached, the app uses the cached file. If the bulk file exists but `bulk_metadata.json` is missing, the app reuses the local file without downloading.
+**When the cache refreshes.** When the bulk file is more than 24 hours old, the app checks Scryfall's metadata and downloads a new file only if Scryfall has published a newer one. If Scryfall can't be reached, the app uses the cached file.
 
-**Older cache files.** When run from source, the app copies any of these three files that it finds next to the script into the data folder on first load.
+If the bulk file exists but `bulk_metadata.json` is missing (for example, after copying in an old cache), the app marks the local file as `local-existing-file` and from then on reuses it without ever checking Scryfall. To get current data again, delete `scryfall_all_cards.jsonl.gz`.
 
-**Forcing a full re-download.** Delete the `ScryfallToPNG` folder.
+**Older cache files.** When run from source, each load copies any of these three files that it finds next to the script into the data folder, if that file isn't already there.
+
+**Forcing a full re-download.** Delete `scryfall_all_cards.jsonl.gz`, or the whole `ScryfallToPNG` folder.
 
 ## Building the app with PyInstaller
 
-The app was built as a windowed, one-folder macOS `.app` bundle (`console=False`, UPX enabled, no icon, no bundle identifier, no extra data files). The bulk data isn't bundled; it's downloaded at runtime. The original spec file isn't in this repository. This command does the same thing:
+The prebuilt app is a windowed PyInstaller `.app` bundle for arm64 with PyInstaller's default icon and bundle identifier and no extra data files. It bundles its own Python (3.14). The bulk data isn't bundled; it's downloaded at runtime. The original spec file isn't in this repository. This command builds an equivalent app:
 
 ```
 # macOS
@@ -166,10 +182,12 @@ The output goes to `dist/`. PyInstaller doesn't cross-compile, so build on the p
 | "Incomplete bulk download" | The download was interrupted. Click **Load / Update Scryfall Bulk** again. |
 | A loading or indexing error after a crash or full disk | Delete the `ScryfallToPNG` data folder and load again. |
 | "MATCH UNRESOLVED: no unambiguous compatible printing" | Check that the title ends with the right set code in parentheses, and that `Body (HTML)` has the collector number. Adding the Scryfall ID metafield gives a precise match. |
-| "Scryfall ID absent from local bulk index" | The card is newer than your cached bulk data. Delete `bulk_metadata.json` and the `.pkl` index, then load again. This forces a metadata check. |
+| "Scryfall ID absent from local bulk index" | The card is newer than your cached bulk data, or the ID is wrong. Delete `scryfall_all_cards.jsonl.gz` from the data folder and load again to download current data. (Deleting only `bulk_metadata.json` does not work: the app then keeps the old file and stops checking for updates.) |
 | "oracle ID printing ambiguous or incompatible" | An Oracle ID covers many printings. Use the printing ID, or make sure the set, collector number and finish identify exactly one printing. |
 | "missing prior image/handle" | An image-only row's Handle doesn't match a product row that matched earlier in the file. |
-| A CSV encoding error | Re-save the export as UTF-8 CSV. |
+| Nothing happens after choosing the CSV | Processing stopped on an error, which the app doesn't show in a dialog. Run from source in a terminal to see the traceback. The usual cause is encoding: the file must be UTF-8. |
+| `URL handle` is blank in the output after editing the CSV in Excel | Excel's "CSV UTF-8" format adds a byte-order mark that the app doesn't strip, so the first column (`Handle`) isn't recognised. Image-only rows can then get the wrong card. Use the original Shopify export, or save as UTF-8 without a BOM. |
+| The window shows "Not Responding" while loading | Loading and indexing run on the GUI thread. Wait for it to finish. |
 | Inventory values look wrong after import | `Inventory quantity` is always written as `deny`. Check that column before importing, or leave inventory columns out of your Shopify import. |
 | macOS says the app is damaged or from an unidentified developer | The app isn't notarized. Right-click it and choose **Open**, or allow it in System Settings > Privacy & Security. |
 
