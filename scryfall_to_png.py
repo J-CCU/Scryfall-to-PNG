@@ -10,6 +10,8 @@ import sys
 import shutil
 import re
 import pickle
+import queue
+import threading
 import requests
 import tkinter as tk
 from datetime import datetime, timedelta
@@ -712,24 +714,67 @@ class ScryfallBulkGUI(tk.Tk):
         self.update_idletasks()
 
     def load_bulk(self):
+
+        # Loading and indexing run on a worker thread so the window stays
+        # responsive. The worker never touches Tk; it queues UI calls that the
+        # main thread runs from an after() poll.
+
+        self._select_state_before_load = str(self.select_btn.cget("state"))
+        self.load_btn.config(state="disabled")
+        self.select_btn.config(state="disabled")
+        self._ui_queue = queue.Queue()
+        threading.Thread(target=self._load_bulk_worker, daemon=True).start()
+        self.after(50, self._drain_ui_queue)
+
+    def _ui(self, func, *args, **kwargs):
+        self._ui_queue.put((func, args, kwargs))
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                func, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if func is None:
+                self.load_btn.config(state="normal")
+                return
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:
+                self.log_message(f"UI update failed: {exc}")
+        self.after(50, self._drain_ui_queue)
+
+    def _set_progress(self, **options):
+        for key, value in options.items():
+            self.progress[key] = value
+
+    def _load_bulk_worker(self):
+        log = lambda msg: self._ui(self.log_message, msg)
         try:
-            migrate_existing_cache(self.log_message)
+            migrate_existing_cache(log)
             meta = load_bulk_metadata()
-            self.log_message(f"Persistent Scryfall data directory: {DATA_DIR}")
-            self.log_message("Checking bulk file cache...")
+            log(f"Persistent Scryfall data directory: {DATA_DIR}")
+            log("Checking bulk file cache...")
 
             # An existing local bulk file without metadata can be reused when
             # offline, but rebuilding metadata is preferred when online.
             
+            adopted_local_file = False
             if meta is None and os.path.exists(BULK_FILENAME):
-                self.log_message("Existing bulk file without metadata; using local data.")
+                log("Existing bulk file without metadata; using local data.")
                 meta = {"updated_at": "local-existing-file"}
                 save_bulk_metadata(meta)
+                adopted_local_file = True
             if not bulk_file_is_fresh(BULK_FILENAME, meta):
-                self.log_message("Bulk cache is missing or older than 24 hours; checking Scryfall...")
-                self.progress["value"] = 0
+                log("Bulk cache is missing or older than 24 hours; checking Scryfall...")
+                self._ui(self._set_progress, value=0)
                 unchanged = False
-                if os.path.exists(BULK_FILENAME) and meta and meta.get("updated_at") != "local-existing-file":
+                if adopted_local_file:
+                    # Keep previously downloaded data instead of forcing a huge
+                    # first-run re-download solely because metadata is missing.
+                    # Later stale checks compare against Scryfall as usual.
+                    unchanged = True
+                elif os.path.exists(BULK_FILENAME) and meta:
                     try:
                         response = requests.get(BULK_META_URL, headers=USER_AGENT, timeout=30)
                         response.raise_for_status()
@@ -737,25 +782,22 @@ class ScryfallBulkGUI(tk.Tk):
                                      if v.get("type") == BULK_TYPE), None)
                         unchanged = bool(item and item.get("updated_at") == meta.get("updated_at"))
                     except requests.RequestException as exc:
-                        self.log_message(f"Metadata check unavailable; using cached data: {exc}")
+                        log(f"Metadata check unavailable; using cached data: {exc}")
                         unchanged = True
-                elif os.path.exists(BULK_FILENAME) and meta and meta.get("updated_at") == "local-existing-file":
-                    # Keep previously downloaded data instead of forcing a huge
-                    # first-run re-download solely because metadata is missing.
-                    unchanged = True
                 if unchanged:
                     os.utime(BULK_FILENAME, None)
-                    self.log_message("Reusing existing bulk data.")
+                    log("Reusing existing bulk data.")
                 else:
                     download_bulk_file(
                         BULK_FILENAME,
-                        progress_callback=self.update_download_progress,
-                        log_callback=self.log_message,
+                        progress_callback=lambda done, total: self._ui(
+                            self.update_download_progress, done, total),
+                        log_callback=log,
                     )
                 meta = load_bulk_metadata()
             else:
-                self.log_message("Bulk file is fresh.")
-            idx = load_index(meta, log_callback=self.log_message)
+                log("Bulk file is fresh.")
+            idx = load_index(meta, log_callback=log)
             if idx:
                 (
                     self.triple,
@@ -769,14 +811,12 @@ class ScryfallBulkGUI(tk.Tk):
                 ) = idx
                 self.printing_index = make_printing_index(self.coll_only)
                 self.exact_id_index, self.oracle_id_index = make_exact_id_index(self.coll_only)
-                self.log_message("Index ready (cached).")
-                self.select_btn.config(state="normal")
+                log("Index ready (cached).")
+                self._ui(self.select_btn.config, {"state": "normal"})
                 return
-            self.progress["value"] = 0
-            self.progress["mode"] = "indeterminate"
-            self.progress.start(10)
-            self.update_idletasks()
-            cards = load_bulk_data(BULK_FILENAME, log_callback=self.log_message)
+            self._ui(self._set_progress, value=0, mode="indeterminate")
+            self._ui(self.progress.start, 10)
+            cards = load_bulk_data(BULK_FILENAME, log_callback=log)
             (
                 self.triple,
                 self.double,
@@ -786,7 +826,7 @@ class ScryfallBulkGUI(tk.Tk):
                 self.oracle_single,
                 self.coll_set,
                 self.coll_only,
-            ) = build_index(cards, log_callback=self.log_message)
+            ) = build_index(cards, log_callback=log)
             self.printing_index = make_printing_index(self.coll_only)
             self.exact_id_index, self.oracle_id_index = make_exact_id_index(self.coll_only)
             save_index(
@@ -799,19 +839,20 @@ class ScryfallBulkGUI(tk.Tk):
                 self.coll_set,
                 self.coll_only,
                 meta,
-                log_callback=self.log_message,
+                log_callback=log,
             )
-            self.progress.stop()
-            self.progress["mode"] = "determinate"
-            self.progress["value"] = 0
-            self.log_message("Bulk data loaded and indexed.")
-            self.select_btn.config(state="normal")
+            self._ui(self.progress.stop)
+            self._ui(self._set_progress, mode="determinate", value=0)
+            log("Bulk data loaded and indexed.")
+            self._ui(self.select_btn.config, {"state": "normal"})
         except Exception as e:
-            self.progress.stop()
-            self.progress["mode"] = "determinate"
-            self.progress["value"] = 0
-            self.log_message(f"Bulk load failed: {e}")
-            messagebox.showerror("Bulk Load Error", str(e))
+            self._ui(self.progress.stop)
+            self._ui(self._set_progress, mode="determinate", value=0)
+            log(f"Bulk load failed: {e}")
+            self._ui(self.select_btn.config, {"state": self._select_state_before_load})
+            self._ui(messagebox.showerror, "Bulk Load Error", str(e))
+        finally:
+            self._ui(None)
 
     def select_file(self):
         file_path = filedialog.askopenfilename(
@@ -821,7 +862,11 @@ class ScryfallBulkGUI(tk.Tk):
         if not file_path:
             messagebox.showerror("Error", "No file selected.")
             return
-        self.process_csv(file_path)
+        try:
+            self.process_csv(file_path)
+        except Exception as e:
+            self.log_message(f"Processing failed: {e}")
+            messagebox.showerror("Processing Error", str(e))
 
     def build_template_row(self, src_row: dict) -> dict:
         
@@ -839,7 +884,7 @@ class ScryfallBulkGUI(tk.Tk):
             "Published on online store": r.get("Published", ""),
             "Status": r.get("Status", ""),
             "SKU": r.get("Variant SKU", ""),
-            "Barcode": r.get("Variant Barcodes", ""),
+            "Barcode": r.get("Variant Barcode", ""),
             "Option1 name": r.get("Option1 Name", ""),
             "Option1 value": r.get("Option1 Value", ""),
             "Option1 Linked To": r.get("Option1 Linked To", ""),
@@ -859,7 +904,7 @@ class ScryfallBulkGUI(tk.Tk):
             "Unit price base measure": r.get("Unit Price Base Measure", ""),
             "Unit price base measure unit": r.get("Unit Price Base Measure Unit", ""),
             "Inventory tracker": r.get("Variant Inventory Tracker", ""),
-            "Inventory quantity": "deny",
+            "Inventory quantity": r.get("Variant Inventory Qty", ""),
             "Continue selling when out of stock": "deny",
         }
         out["Weight value (grams)"] = r.get("Variant Grams", "")
@@ -914,7 +959,7 @@ class ScryfallBulkGUI(tk.Tk):
         base_name = os.path.basename(input_path)
         output_path = os.path.join(base_dir, f"NEW_{base_name}")
         self.log_message(f"Output will be written to: {output_path}")
-        with open(input_path, newline="", encoding="utf-8") as infile:
+        with open(input_path, newline="", encoding="utf-8-sig") as infile:
             reader = list(csv.DictReader(infile))
         output_rows = []
         success = 0

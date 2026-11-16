@@ -77,7 +77,7 @@ python3 scryfall_to_png.py
 
 ## Input
 
-A Shopify **product export** CSV, encoded as UTF-8. These columns are used:
+A Shopify **product export** CSV, encoded as UTF-8 (with or without a byte-order mark). These columns are used:
 
 | Column | Used for |
 |---|---|
@@ -126,8 +126,9 @@ Values for most columns are copied from the matching export column. For example,
   - `Product image URL` is set to the Scryfall PNG URL.
   - `Image position` is set to 1 for the front face, or 2 for the back face of a double-faced card.
 - `Google Shopping / Ad group name` and `Google Shopping / Ads labels` are always blank.
-- `Barcode` is read from a `Variant Barcodes` column, so it is blank for a standard Shopify export (which names the column `Variant Barcode`).
-- `Inventory quantity` and `Continue selling when out of stock` are both always set to `deny`.
+- `Barcode` is copied from `Variant Barcode`.
+- `Inventory quantity` is copied from `Variant Inventory Qty`.
+- `Continue selling when out of stock` is always set to `deny`.
 
 Rows that don't match are still written to the output with their original image data. The reason they failed is shown in the GUI log. No separate error report is created. The success and failure counts in the final message cover Magic and image-only rows only; non-Magic rows aren't counted.
 
@@ -149,7 +150,7 @@ There's no settings file. The app stores its cache in a per-user data folder:
 
 **When the cache refreshes.** When the bulk file is more than 24 hours old, the app checks Scryfall's metadata and downloads a new file only if Scryfall has published a newer one. If Scryfall can't be reached, the app uses the cached file.
 
-If the bulk file exists but `bulk_metadata.json` is missing (for example, after copying in an old cache), the app marks the local file as `local-existing-file` and from then on reuses it without ever checking Scryfall. To get current data again, delete `scryfall_all_cards.jsonl.gz`.
+If the bulk file exists but `bulk_metadata.json` is missing (for example, after copying in an old cache), the app marks the local file as `local-existing-file` and reuses it for that load instead of downloading straight away. From the next load more than 24 hours later, it checks Scryfall and downloads a current file (or keeps the local one if Scryfall can't be reached). To get current data immediately, delete `scryfall_all_cards.jsonl.gz`.
 
 **Older cache files.** When run from source, each load copies any of these three files that it finds next to the script into the data folder, if that file isn't already there.
 
@@ -182,13 +183,10 @@ The output goes to `dist/`. PyInstaller doesn't cross-compile, so build on the p
 | "Incomplete bulk download" | The download was interrupted. Click **Load / Update Scryfall Bulk** again. |
 | A loading or indexing error after a crash or full disk | Delete the `ScryfallToPNG` data folder and load again. |
 | "MATCH UNRESOLVED: no unambiguous compatible printing" | Check that the title ends with the right set code in parentheses, and that `Body (HTML)` has the collector number. Adding the Scryfall ID metafield gives a precise match. |
-| "Scryfall ID absent from local bulk index" | The card is newer than your cached bulk data, or the ID is wrong. Delete `scryfall_all_cards.jsonl.gz` from the data folder and load again to download current data. (Deleting only `bulk_metadata.json` does not work: the app then keeps the old file and stops checking for updates.) |
+| "Scryfall ID absent from local bulk index" | The card is newer than your cached bulk data, or the ID is wrong. Delete `scryfall_all_cards.jsonl.gz` from the data folder and load again to download current data. (Deleting only `bulk_metadata.json` is not enough: the app then keeps the old file for another 24 hours before checking for updates.) |
 | "oracle ID printing ambiguous or incompatible" | An Oracle ID covers many printings. Use the printing ID, or make sure the set, collector number and finish identify exactly one printing. |
 | "missing prior image/handle" | An image-only row's Handle doesn't match a product row that matched earlier in the file. |
-| Nothing happens after choosing the CSV | Processing stopped on an error, which the app doesn't show in a dialog. Run from source in a terminal to see the traceback. The usual cause is encoding: the file must be UTF-8. |
-| `URL handle` is blank in the output after editing the CSV in Excel | Excel's "CSV UTF-8" format adds a byte-order mark that the app doesn't strip, so the first column (`Handle`) isn't recognised. Image-only rows can then get the wrong card. Use the original Shopify export, or save as UTF-8 without a BOM. |
-| The window shows "Not Responding" while loading | Loading and indexing run on the GUI thread. Wait for it to finish. |
-| Inventory values look wrong after import | `Inventory quantity` is always written as `deny`. Check that column before importing, or leave inventory columns out of your Shopify import. |
+| "Processing Error" after choosing the CSV | Processing stopped on an error; the message is shown in the dialog and the log. The usual cause is encoding: the file must be UTF-8. |
 | macOS says the app is damaged or from an unidentified developer | The app isn't notarized. Right-click it and choose **Open**, or allow it in System Settings > Privacy & Security. |
 
 ## File guide
