@@ -12,6 +12,7 @@ import re
 import pickle
 import queue
 import threading
+import time
 import requests
 import tkinter as tk
 from datetime import datetime, timedelta
@@ -42,7 +43,11 @@ def get_data_directory() -> Path:
 DATA_DIR = get_data_directory()
 BULK_FILENAME = str(DATA_DIR / "scryfall_all_cards.jsonl.gz")
 META_FILENAME = str(DATA_DIR / "bulk_metadata.json")
-INDEX_FILENAME = str(DATA_DIR / "scryfall_all_cards_index_en.pkl")
+# Bump INDEX_VERSION whenever the cached index layout changes so old caches rebuild.
+INDEX_VERSION = 2
+INDEX_FILENAME = str(DATA_DIR / f"scryfall_all_cards_index_v{INDEX_VERSION}.pkl")
+# Version 1 pickled every full card dict (~3 GB); it is never read, only removed.
+LEGACY_INDEX_FILENAME = str(DATA_DIR / "scryfall_all_cards_index_en.pkl")
 USER_AGENT = {"User-Agent": "ShopifyScryfallImageExtractor/2.0 (Scryfall bulk data)"}
 
 def migrate_existing_cache(log_callback=None):
@@ -55,7 +60,7 @@ def migrate_existing_cache(log_callback=None):
     if source_dir == DATA_DIR:
         return
     for name in ("scryfall_all_cards.jsonl.gz", "bulk_metadata.json",
-                 "scryfall_all_cards_index_en.pkl"):
+                 os.path.basename(INDEX_FILENAME)):
         source = source_dir / name
         destination = DATA_DIR / name
         if not source.is_file() or destination.exists():
@@ -201,13 +206,47 @@ def download_bulk_file(path: str, progress_callback=None, log_callback=None):
         log_callback("Download complete.")
     save_bulk_metadata({"updated_at": updated_at})
 
+# Card fields read by indexing, matching and output (build_index, card_names,
+# match_printing, resolve_printing, describe_printing_conflicts,
+# prefer_language, extract_png_urls, process_csv). Everything else in a
+# Scryfall card record is dropped so the in-memory and cached index stay small.
+CARD_FIELDS = ("id", "oracle_id", "name", "printed_name", "lang", "set",
+               "collector_number", "finishes")
+FACE_FIELDS = ("name", "printed_name")
+# Long loops hand the GIL to the GUI thread every this many items.
+YIELD_EVERY = 5000
+
+def slim_card(card, _shared={}):
+    slim = {k: card[k] for k in CARD_FIELDS if k in card}
+    for k in ("lang", "set"):
+        if isinstance(slim.get(k), str):
+            slim[k] = sys.intern(slim[k])
+    if isinstance(slim.get("finishes"), list):
+        key = tuple(slim["finishes"])
+        slim["finishes"] = _shared.setdefault(key, list(key))
+    png = (card.get("image_uris") or {}).get("png")
+    if png:
+        slim["image_uris"] = {"png": png}
+    if "card_faces" in card:
+        faces = []
+        for face in card["card_faces"] or []:
+            f = {k: face[k] for k in FACE_FIELDS if k in face}
+            png = (face.get("image_uris") or {}).get("png")
+            if png:
+                f["image_uris"] = {"png": png}
+            faces.append(f)
+        slim["card_faces"] = faces
+    return slim
+
 def load_bulk_data(path: str, log_callback=None):
     if log_callback:
         log_callback("Loading bulk data...")
     cards = []
     with gzip.open(path, "rt", encoding="utf-8") as f:
-        for line in f:
-            cards.append(json.loads(line))
+        for n, line in enumerate(f, start=1):
+            cards.append(slim_card(json.loads(line)))
+            if n % YIELD_EVERY == 0:
+                time.sleep(0)
     if log_callback:
         log_callback(f"Loaded {len(cards)} cards.")
     return cards
@@ -227,7 +266,9 @@ def build_index(cards, log_callback=None):
     oracle_single = {}
     coll_set = {}
     coll_only = {}
-    for c in cards:
+    for n, c in enumerate(cards, start=1):
+        if n % YIELD_EVERY == 0:
+            time.sleep(0)
         name = c.get("name", "")
         printed = c.get("printed_name", "")
         set_code = c.get("set", "")
@@ -287,58 +328,62 @@ def build_index(cards, log_callback=None):
         coll_only,
     )
 
-def save_index(
-    triple,
-    double,
-    single,
-    oracle_triple,
-    oracle_double,
-    oracle_single,
-    coll_set,
-    coll_only,
-    meta,
-    log_callback=None,
-):
-    payload = {
+# The cache holds the slimmed card list (see slim_card) as a small header
+# followed by fixed-size pickled chunks. One huge pickle.load/dump would hold
+# the GIL for minutes and freeze the window; chunks let the GUI run in between.
+# The lookup dicts are rebuilt from the list with build_index on load.
+INDEX_CHUNK = 20000
+
+def save_index(cards, meta, log_callback=None):
+    header = {
+        "index_version": INDEX_VERSION,
         "meta_updated_at": meta.get("updated_at") if meta else None,
-        "triple": triple,
-        "double": double,
-        "single": single,
-        "oracle_triple": oracle_triple,
-        "oracle_double": oracle_double,
-        "oracle_single": oracle_single,
-        "coll_set": coll_set,
-        "coll_only": coll_only,
+        "count": len(cards),
     }
-    with open(INDEX_FILENAME, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    temp = INDEX_FILENAME + ".tmp"
+    try:
+        with open(temp, "wb") as f:
+            pickle.dump(header, f, protocol=pickle.HIGHEST_PROTOCOL)
+            for start in range(0, len(cards), INDEX_CHUNK):
+                pickle.dump(cards[start:start + INDEX_CHUNK], f,
+                            protocol=pickle.HIGHEST_PROTOCOL)
+                time.sleep(0)
+        os.replace(temp, INDEX_FILENAME)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
     if log_callback:
         log_callback("Index saved.")
 
 def load_index(meta, log_callback=None):
+    if os.path.exists(LEGACY_INDEX_FILENAME):
+        try:
+            os.remove(LEGACY_INDEX_FILENAME)
+            if log_callback:
+                log_callback("Removed old-format index cache; it will be rebuilt.")
+        except OSError:
+            pass
     if not os.path.exists(INDEX_FILENAME) or not meta:
         return None
     try:
         with open(INDEX_FILENAME, "rb") as f:
-            payload = pickle.load(f)
+            header = pickle.load(f)
+            if (not isinstance(header, dict)
+                    or header.get("index_version") != INDEX_VERSION):
+                return None
+            if header.get("meta_updated_at") != meta.get("updated_at"):
+                if log_callback:
+                    log_callback("Cached index stale.")
+                return None
+            cards = []
+            while len(cards) < header["count"]:
+                cards.extend(pickle.load(f))
+                time.sleep(0)
     except Exception:
-        return None
-    if payload.get("meta_updated_at") != meta.get("updated_at"):
-        if log_callback:
-            log_callback("Cached index stale.")
         return None
     if log_callback:
         log_callback("Loaded cached index.")
-    return (
-        payload["triple"],
-        payload["double"],
-        payload["single"],
-        payload["oracle_triple"],
-        payload["oracle_double"],
-        payload["oracle_single"],
-        payload["coll_set"],
-        payload["coll_only"],
-    )
+    return cards
     
 # ------------------------------------------------------------
 # NAME / SET / COLLECTOR EXTRACTION
@@ -377,7 +422,7 @@ def normalize_set_code(code: str | None) -> str | None:
     code = re.sub(r"\s+", " ", code.strip().lower())
     if re.fullmatch(r"(?:friday night magic|fnm)(?:\s*[-/]?\s*(?:foil|nonfoil|non-foil))?", code):
         return "fnm"
-    return {"list": "plist"}.get(code, code)
+    return {"list": "plst"}.get(code, code)
 
 def extract_collector_number(body_html: str) -> str | None:
     m = re.search(
@@ -562,6 +607,10 @@ def resolve_printing(exact_index, oracle_index, printing_index, names, set_code,
                        and (not finish or finish in (c.get("finishes") or []))
                        and (not names or any(n.casefold().strip() in card_names(c) for n in names))
                        and extract_png_urls(c)]
+            # Same English preference as match_printing.
+            english = [c for c in choices if c.get("lang") == "en"]
+            if english:
+                choices = english
             if len(choices) == 1:
                 return choices[0], "oracle ID with verified printing", []
             return None, "oracle ID printing ambiguous or incompatible", []
@@ -658,6 +707,10 @@ def extract_png_urls(card):
 # ------------------------------------------------------------
 # GUI
 # ------------------------------------------------------------
+
+# Shopify export columns that only a variant row fills in.
+VARIANT_FIELDS = ("Option1 Value", "Option2 Value", "Option3 Value",
+                  "Variant SKU", "Variant Price", "Variant Barcode")
 
 class ScryfallBulkGUI(tk.Tk):
     def __init__(self):
@@ -797,26 +850,13 @@ class ScryfallBulkGUI(tk.Tk):
                 meta = load_bulk_metadata()
             else:
                 log("Bulk file is fresh.")
-            idx = load_index(meta, log_callback=log)
-            if idx:
-                (
-                    self.triple,
-                    self.double,
-                    self.single,
-                    self.oracle_triple,
-                    self.oracle_double,
-                    self.oracle_single,
-                    self.coll_set,
-                    self.coll_only,
-                ) = idx
-                self.printing_index = make_printing_index(self.coll_only)
-                self.exact_id_index, self.oracle_id_index = make_exact_id_index(self.coll_only)
-                log("Index ready (cached).")
-                self._ui(self.select_btn.config, {"state": "normal"})
-                return
             self._ui(self._set_progress, value=0, mode="indeterminate")
             self._ui(self.progress.start, 10)
-            cards = load_bulk_data(BULK_FILENAME, log_callback=log)
+            cards = load_index(meta, log_callback=log)
+            cached = cards is not None
+            if not cached:
+                cards = load_bulk_data(BULK_FILENAME, log_callback=log)
+                save_index(cards, meta, log_callback=log)
             (
                 self.triple,
                 self.double,
@@ -829,21 +869,10 @@ class ScryfallBulkGUI(tk.Tk):
             ) = build_index(cards, log_callback=log)
             self.printing_index = make_printing_index(self.coll_only)
             self.exact_id_index, self.oracle_id_index = make_exact_id_index(self.coll_only)
-            save_index(
-                self.triple,
-                self.double,
-                self.single,
-                self.oracle_triple,
-                self.oracle_double,
-                self.oracle_single,
-                self.coll_set,
-                self.coll_only,
-                meta,
-                log_callback=log,
-            )
+            del cards
             self._ui(self.progress.stop)
             self._ui(self._set_progress, mode="determinate", value=0)
-            log("Bulk data loaded and indexed.")
+            log("Index ready (cached)." if cached else "Bulk data loaded and indexed.")
             self._ui(self.select_btn.config, {"state": "normal"})
         except Exception as e:
             self._ui(self.progress.stop)
@@ -862,11 +891,25 @@ class ScryfallBulkGUI(tk.Tk):
         if not file_path:
             messagebox.showerror("Error", "No file selected.")
             return
+
+        # Processing runs on a worker thread with the same UI queue as loading.
+
+        self.load_btn.config(state="disabled")
+        self.select_btn.config(state="disabled")
+        self._ui_queue = queue.Queue()
+        threading.Thread(target=self._process_csv_worker, args=(file_path,),
+                         daemon=True).start()
+        self.after(50, self._drain_ui_queue)
+
+    def _process_csv_worker(self, file_path):
         try:
             self.process_csv(file_path)
         except Exception as e:
-            self.log_message(f"Processing failed: {e}")
-            messagebox.showerror("Processing Error", str(e))
+            self._ui(self.log_message, f"Processing failed: {e}")
+            self._ui(messagebox.showerror, "Processing Error", str(e))
+        finally:
+            self._ui(self.select_btn.config, {"state": "normal"})
+            self._ui(None)
 
     def build_template_row(self, src_row: dict) -> dict:
         
@@ -958,7 +1001,11 @@ class ScryfallBulkGUI(tk.Tk):
         base_dir = os.path.dirname(os.path.abspath(input_path))
         base_name = os.path.basename(input_path)
         output_path = os.path.join(base_dir, f"NEW_{base_name}")
-        self.log_message(f"Output will be written to: {output_path}")
+
+        # Runs on a worker thread: all Tk access goes through the UI queue.
+
+        log = lambda msg: self._ui(self.log_message, msg)
+        log(f"Output will be written to: {output_path}")
         with open(input_path, newline="", encoding="utf-8-sig") as infile:
             reader = list(csv.DictReader(infile))
         output_rows = []
@@ -969,23 +1016,33 @@ class ScryfallBulkGUI(tk.Tk):
         fail = 0
         handle_to_card = {}
         total = len(reader)
-        self.progress["maximum"] = total
-        self.progress["value"] = 0
-        self.progress["mode"] = "determinate"
+        self._ui(self._set_progress, maximum=total, value=0, mode="determinate")
         for idx, row in enumerate(reader, start=1):
-            self.progress["value"] = idx
-            self.update_idletasks()
+            self._ui(self._set_progress, value=idx)
             vendor = row.get("Vendor", "")
             title = row.get("Title", "")
             body_html = row.get("Body (HTML)", "") or ""
-            is_image_only_row = (vendor == "" and title == "" and body_html == "")
+            is_continuation_row = (vendor == "" and title == "" and body_html == "")
+
+            # Shopify exports put each further variant of a product on its own
+            # row with blank Title/Vendor/Body; such a row carries variant data
+            # and is passed through unchanged. Only a continuation row with
+            # image fields and no variant data is an extra image row.
+
+            is_variant_row = is_continuation_row and any(
+                (row.get(k) or "").strip() for k in VARIANT_FIELDS)
+            is_image_only_row = (is_continuation_row and not is_variant_row and any(
+                (row.get(k) or "").strip() for k in ("Image Src", "Image Position")))
+            if is_continuation_row and not is_image_only_row:
+                output_rows.append(self.build_template_row(row))
+                continue
             if vendor != "Magic: The Gathering" and not is_image_only_row:
                 if row.get("Image Src") and not (row.get("Image Alt Text") or "").strip():
                     row["Image Alt Text"] = extract_name(title) or title.strip()
                 output_rows.append(self.build_template_row(row))
                 continue
             handle = row.get("Handle", "")
-            self.log_message(f"Processing: {title}")
+            log(f"Processing: {title}")
             name_candidates = extract_name_candidates(title)
             raw_set = extract_set_code(title)
             set_code = normalize_set_code(raw_set)
@@ -994,7 +1051,7 @@ class ScryfallBulkGUI(tk.Tk):
             )
             scryfall_id_field = "Scryfall ID (product.metafields.custom.scryfall_id)"
             oracle_id = row.get(scryfall_id_field, "").strip() or None
-            self.log_message(
+            log(
                 f"  DEBUG PRE-MATCH: name_candidates={name_candidates}, "
                 f"raw_set={raw_set}, set_code={set_code}, "
                 f"collector_number={collector_number}, oracle_id={oracle_id}"
@@ -1012,20 +1069,20 @@ class ScryfallBulkGUI(tk.Tk):
                     finish=finish, scryfall_id=oracle_id)
                 if card:
                     handle_to_card[handle] = card
-                    self.log_message(f"  MATCH: {match_method} | card_id={card.get('id')}")
+                    log(f"  MATCH: {match_method} | card_id={card.get('id')}")
                     if conflicts:
-                        self.log_message("  WARNING: CSV conflicts with exact Scryfall printing: " + ", ".join(conflicts))
+                        log("  WARNING: CSV conflicts with exact Scryfall printing: " + ", ".join(conflicts))
                 else:
-                    self.log_message("  MATCH UNRESOLVED: " + match_method)
+                    log("  MATCH UNRESOLVED: " + match_method)
             if not card:
                 fail += 1
-                self.log_message("  X MATCH FAILED")
+                log("  X MATCH FAILED")
                 output_rows.append(self.build_template_row(row))
                 continue
             png_urls = extract_png_urls(card)
             if not png_urls:
                 fail += 1
-                self.log_message("  X NO PNG FOUND")
+                log("  X NO PNG FOUND")
                 output_rows.append(self.build_template_row(row))
                 continue
             if is_image_only_row and "card_faces" in card:
@@ -1044,7 +1101,7 @@ class ScryfallBulkGUI(tk.Tk):
                     alt_name = (faces[1].get("name", "") if len(faces) > 1 else "")
                     alt_name = alt_name or card.get("name", "")
                 else:
-                    alt_name = extract_name(title) or card.get("name", "")
+                    alt_name = (name_candidates[0] if name_candidates else "") or card.get("name", "")
                 row["Image Alt Text"] = alt_name.strip() or "Magic: The Gathering card"
             output_rows.append(self.build_template_row(row))
             success += 1
@@ -1080,11 +1137,12 @@ class ScryfallBulkGUI(tk.Tk):
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
             raise
-        messagebox.showinfo(
+        self._ui(
+            messagebox.showinfo,
             "Complete",
             f"Finished processing.\n\nSuccess: {success}\nFailed: {fail}\n\nSaved to:\n{output_path}",
         )
-        self.log_message("Processing complete.")
+        log("Processing complete.")
 
 # ------------------------------------------------------------
 # MAIN

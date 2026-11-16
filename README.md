@@ -23,7 +23,7 @@ In the window (titled "Scryfall Image Extractor"), click **Load / Update Scryfal
 - Builds a lookup index and caches it to disk, so later launches start quickly.
 - Matches each card by:
   1. Scryfall printing ID, when the CSV's Scryfall ID column has one. This match takes priority.
-  2. Oracle ID (same column), narrowed down by set, collector number, finish and name to exactly one printing.
+  2. Oracle ID (same column), narrowed down by set, collector number, finish and name to exactly one printing, preferring the English printing when other languages also match.
   3. Without an ID: name + set code, plus collector number and finish when they are present. The set code is required.
 - Leaves a product unmatched instead of guessing when the match is ambiguous. It never swaps in a printing from a different set.
 - Prefers English printings when there's more than one choice.
@@ -39,7 +39,7 @@ Running from source needs the following; the prebuilt app needs only internet ac
 - Python 3.10 or newer, with Tkinter (included with the python.org installers; on Linux install `python3-tk`, with Homebrew Python on macOS `brew install python-tk`)
 - [requests](https://pypi.org/project/requests/)
 - Internet access the first time you load the bulk data, and for later refreshes
-- Several GB of free disk space for the cached bulk file and index, plus enough memory to load the full card list while the index is built
+- About 600 MB of free disk space for the cached bulk file and index, and about 1.5 GB of free memory while loading
 
 ```
 # Windows
@@ -96,7 +96,7 @@ A Shopify **product export** CSV, encoded as UTF-8 (with or without a byte-order
 - Trailing parenthetical labels are stripped from the name.
 - Two set codes are mapped to Scryfall's codes:
   - `FNM` or `Friday Night Magic` becomes `fnm`
-  - `List` becomes `plist`
+  - `List` becomes `plst`
 
 **Finish.**
 
@@ -104,7 +104,9 @@ A Shopify **product export** CSV, encoded as UTF-8 (with or without a byte-order
 - `non-foil`, `nonfoil`, `not foil` or `regular finish` means nonfoil.
 - If neither appears, the finish isn't used to filter matches.
 
-**Image-only rows.** A row with blank Vendor, Title and Body (HTML) is treated as an extra image row for a product earlier in the file with the same `Handle`. For a double-faced card, it gets the back-face PNG and `Image Position` 2. For any other card, it gets the front PNG and `Image Position` 1.
+**Variant rows.** A row with blank Vendor, Title and Body (HTML) that has variant data (`Option1`-`Option3 Value`, `Variant SKU`, `Variant Price` or `Variant Barcode`) is another variant of the product above it, as in Shopify's export. It is copied to the output unchanged and isn't counted as a success or failure.
+
+**Image-only rows.** A row with blank Vendor, Title and Body (HTML), no variant data, and `Image Src` or `Image Position` filled in is treated as an extra image row for a product earlier in the file with the same `Handle`. For a double-faced card, it gets the back-face PNG and `Image Position` 2. For any other card, it gets the front PNG and `Image Position` 1.
 
 ## Output
 
@@ -130,7 +132,7 @@ Values for most columns are copied from the matching export column. For example,
 - `Inventory quantity` is copied from `Variant Inventory Qty`.
 - `Continue selling when out of stock` is always set to `deny`.
 
-Rows that don't match are still written to the output with their original image data. The reason they failed is shown in the GUI log. No separate error report is created. The success and failure counts in the final message cover Magic and image-only rows only; non-Magic rows aren't counted.
+Rows that don't match are still written to the output with their original image data. The reason they failed is shown in the GUI log. No separate error report is created. The success and failure counts in the final message cover Magic and image-only rows only; non-Magic rows and variant rows aren't counted.
 
 ## Settings, config and cache
 
@@ -146,7 +148,7 @@ There's no settings file. The app stores its cache in a per-user data folder:
 |---|---|
 | `scryfall_all_cards.jsonl.gz` | Scryfall All Cards bulk data |
 | `bulk_metadata.json` | `updated_at` timestamp of the cached bulk file |
-| `scryfall_all_cards_index_en.pkl` | Cached lookup index, rebuilt when the bulk data changes |
+| `scryfall_all_cards_index_v2.pkl` | Cached lookup index (only the card fields the matcher uses, about 140 MB), rebuilt when the bulk data changes. An older `scryfall_all_cards_index_en.pkl` (about 3 GB) is deleted on the next load. |
 
 **When the cache refreshes.** When the bulk file is more than 24 hours old, the app checks Scryfall's metadata and downloads a new file only if Scryfall has published a newer one. If Scryfall can't be reached, the app uses the cached file.
 
