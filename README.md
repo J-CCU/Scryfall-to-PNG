@@ -10,6 +10,8 @@ It is for Shopify store owners who list Magic singles and want official card ima
 
 ## Quick start
 
+A prebuilt app isn't included right now; run the script with Python as below, or build the app yourself (see [Building the app with PyInstaller](#building-the-app-with-pyinstaller)).
+
 ```
 python3 -m pip install requests      # Windows: py -m pip install requests
 python3 scryfall_to_png.py           # Windows: py scryfall_to_png.py
@@ -34,7 +36,7 @@ In the window (titled "Scryfall Image Extractor"), click **Load / Update Scryfal
 
 ## Requirements
 
-Running from source needs the following; the prebuilt app needs only internet access and disk space.
+Running from source needs the following; an app you've built needs only internet access and disk space.
 
 - Python 3.10 or newer, with Tkinter (included with the python.org installers; on Linux install `python3-tk`, with Homebrew Python on macOS `brew install python-tk`)
 - [requests](https://pypi.org/project/requests/)
@@ -51,12 +53,12 @@ python3 -m pip install requests
 
 ## How to run
 
-### Prebuilt app (macOS, Apple Silicon)
+### Built app
 
-1. Unzip `Scryfall to PNG.app.zip`.
-2. Open `Scryfall to PNG.app`. The app isn't notarized, so macOS may block it the first time: right-click it and choose **Open**, or click **Open Anyway** in System Settings > Privacy & Security.
+1. Build the app yourself (see [Building the app with PyInstaller](#building-the-app-with-pyinstaller)).
+2. Open `Scryfall to PNG.app` from `dist/`. The app isn't notarized, so macOS may block it the first time: right-click it and choose **Open**, or click **Open Anyway** in System Settings > Privacy & Security.
 
-The prebuilt app is for Apple Silicon (arm64) Macs only. On Windows, Intel Macs or Linux, run from source.
+A build runs only on the platform and chip type it was built on.
 
 ### From source
 
@@ -160,7 +162,7 @@ If the bulk file exists but `bulk_metadata.json` is missing (for example, after 
 
 ## Building the app with PyInstaller
 
-The prebuilt app is a windowed PyInstaller `.app` bundle for arm64 with PyInstaller's default icon and bundle identifier and no extra data files. It bundles its own Python (3.14). The bulk data isn't bundled; it's downloaded at runtime. The original spec file isn't in this repository. This command builds an equivalent app:
+The earlier prebuilt app was a windowed PyInstaller `.app` bundle for arm64 with PyInstaller's default icon and bundle identifier and no extra data files. It bundles its own Python (3.14). The bulk data isn't bundled; it's downloaded at runtime. The original spec file isn't in this repository. This command builds an equivalent app:
 
 ```
 # macOS
@@ -196,6 +198,5 @@ The output goes to `dist/`. PyInstaller doesn't cross-compile, so build on the p
 | File | What it is |
 |---|---|
 | `scryfall_to_png.py` | Full source: GUI, bulk download and cache, indexing, matching, CSV export |
-| `Scryfall to PNG.app.zip` | Prebuilt macOS app bundle, zipped |
 | `.gitattributes` | Git line-ending settings |
 | `README.md` | This document |
