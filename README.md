@@ -198,5 +198,4 @@ The output goes to `dist/`. PyInstaller doesn't cross-compile, so build on the p
 | File | What it is |
 |---|---|
 | `scryfall_to_png.py` | Full source: GUI, bulk download and cache, indexing, matching, CSV export |
-| `.gitattributes` | Git line-ending settings |
 | `README.md` | This document |
